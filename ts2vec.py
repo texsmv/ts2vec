@@ -4,8 +4,37 @@ from torch.utils.data import TensorDataset, DataLoader
 import numpy as np
 from models import TSEncoder
 from models.losses import hierarchical_contrastive_loss
+from models.losses import SupConLoss
 from utils import take_per_row, split_with_nan, centerize_vary_length_series, torch_pad_nan
 import math
+from torch.utils.data import Dataset, DataLoader
+
+class MyDataset(Dataset):
+    def __init__(self, X, y, transform=None):
+        self.X = X
+        self.y = y
+        
+    def __getitem__(self, index):
+        return self.X[index], self.y[index]
+    
+    def __len__(self):
+        return len(self.X)
+class EarlyStopper:
+    def __init__(self, patience=1, min_delta=0):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.counter = 0
+        self.min_validation_loss = np.inf
+
+    def early_stop(self, validation_loss):
+        if validation_loss < self.min_validation_loss:
+            self.min_validation_loss = validation_loss
+            self.counter = 0
+        elif validation_loss > (self.min_validation_loss + self.min_delta):
+            self.counter += 1
+            if self.counter >= self.patience:
+                return True
+        return False
 
 class TS2Vec:
     '''The TS2Vec model'''
@@ -92,6 +121,8 @@ class TS2Vec:
         
         loss_log = []
         
+        
+        
         while True:
             if n_epochs is not None and self.n_epochs >= n_epochs:
                 break
@@ -148,16 +179,229 @@ class TS2Vec:
             if interrupted:
                 break
             
+            
             cum_loss /= n_epoch_iters
             loss_log.append(cum_loss)
             if verbose:
                 print(f"Epoch #{self.n_epochs}: loss={cum_loss}")
             self.n_epochs += 1
             
+            
             if self.after_epoch_callback is not None:
                 self.after_epoch_callback(self, cum_loss)
+                
+            
             
         return loss_log
+
+    def fit_mod(self, train_data, train_y, val_data, val_y, n_epochs=None, n_iters=None, verbose=False):
+        ''' Training the TS2Vec model.
+        
+        Args:
+            train_data (numpy.ndarray): The training data. It should have a shape of (n_instance, n_timestamps, n_features). All missing data should be set to NaN.
+            n_epochs (Union[int, NoneType]): The number of epochs. When this reaches, the training stops.
+            n_iters (Union[int, NoneType]): The number of iterations. When this reaches, the training stops. If both n_epochs and n_iters are not specified, a default setting would be used that sets n_iters to 200 for a dataset with size <= 100000, 600 otherwise.
+            verbose (bool): Whether to print the training loss after each epoch.
+            
+        Returns:
+            loss_log: a list containing the training losses on each epoch.
+        '''
+        assert train_data.ndim == 3
+        
+        if n_iters is None and n_epochs is None:
+            n_iters = 200 if train_data.size <= 100000 else 600  # default param for n_iters
+        
+        if self.max_train_length is not None:
+            sections = train_data.shape[1] // self.max_train_length
+            if sections >= 2:
+                train_data = np.concatenate(split_with_nan(train_data, sections, axis=1), axis=0)
+
+        temporal_missing = np.isnan(train_data).all(axis=-1).any(axis=0)
+        if temporal_missing[0] or temporal_missing[-1]:
+            train_data = centerize_vary_length_series(train_data)
+                
+        train_data = train_data[~np.isnan(train_data).all(axis=2).all(axis=1)]
+        val_data = val_data[~np.isnan(val_data).all(axis=2).all(axis=1)]
+        
+        train_dataset = MyDataset(train_data, train_y)
+        train_loader = DataLoader(train_dataset, batch_size=min(self.batch_size, len(train_dataset)), shuffle=True, drop_last=True)
+        val_dataset = MyDataset(val_data, val_y)
+        val_loader = DataLoader(val_dataset, batch_size=min(self.batch_size, len(val_dataset)), shuffle=True, drop_last=True)
+        
+        optimizer = torch.optim.AdamW(self._net.parameters(), lr=self.lr)
+        
+        loss_log = []
+        loss_val_log = []
+        
+        contLoss = SupConLoss().to(self.device)
+        
+        early_stopper = EarlyStopper(patience=3, min_delta=0.0)
+        
+        while True:
+            if n_epochs is not None and self.n_epochs >= n_epochs:
+                break
+            
+            cum_loss = 0
+            n_epoch_iters = 0
+            
+            interrupted = False
+            for batch in train_loader:
+                if n_iters is not None and self.n_iters >= n_iters:
+                    interrupted = True
+                    break
+                
+                x = batch[0]
+                y = batch[1]
+                if self.max_train_length is not None and x.size(1) > self.max_train_length:
+                    window_offset = np.random.randint(x.size(1) - self.max_train_length + 1)
+                    x = x[:, window_offset : window_offset + self.max_train_length]
+                x = x.to(self.device)
+                
+                ts_l = x.size(1)
+                crop_l = np.random.randint(low=2 ** (self.temporal_unit + 1), high=ts_l+1)
+                if crop_l > 400:
+                    crop_l = 400
+                crop_left = np.random.randint(ts_l - crop_l + 1)
+                crop_right = crop_left + crop_l
+                crop_eleft = np.random.randint(crop_left + 1)
+                crop_eright = np.random.randint(low=crop_right, high=ts_l + 1)
+                crop_offset = np.random.randint(low=-crop_eleft, high=ts_l - crop_eright + 1, size=x.size(0))
+                
+                optimizer.zero_grad()
+                
+                out1 = self._net(take_per_row(x, crop_offset + crop_eleft, crop_right - crop_eleft))
+                out1 = out1[:, -crop_l:]
+                
+                out2 = self._net(take_per_row(x, crop_offset + crop_left, crop_eright - crop_left))
+                out2 = out2[:, :crop_l]
+                
+                loss = hierarchical_contrastive_loss(
+                    out1,
+                    out2,
+                    temporal_unit=self.temporal_unit
+                )
+                
+                out1 = F.max_pool1d(
+                    out1.transpose(1, 2),
+                    kernel_size = out1.size(1),
+                ).transpose(1, 2)
+                
+                out2 = F.max_pool1d(
+                    out2.transpose(1, 2),
+                    kernel_size = out2.size(1),
+                ).transpose(1, 2)
+                
+                out = torch.cat((out1, out2), dim=1)
+                lossS = contLoss(out, labels=y) * 0.5
+                loss = loss + lossS
+                # loss = lossS
+                
+                loss.backward()
+                optimizer.step()
+                self.net.update_parameters(self._net)
+                    
+                cum_loss += loss.item()
+                n_epoch_iters += 1
+                
+                self.n_iters += 1
+                
+                if self.after_iter_callback is not None:
+                    self.after_iter_callback(self, loss.item())
+            if interrupted:
+                break
+            
+            cum_loss /= n_epoch_iters
+            loss_log.append(cum_loss)
+            self.n_epochs += 1
+            
+            if self.after_epoch_callback is not None:
+                self.after_epoch_callback(self, cum_loss)
+                
+            
+            train_loss = cum_loss
+            
+            # ------------------------------ VALIDATION----------------------------------------------
+            
+            cum_loss = 0
+            n_epoch_iters = 0
+            
+            interrupted = False
+            with torch.no_grad():
+                for batch in val_loader:
+                    if n_iters is not None and self.n_iters >= n_iters:
+                        interrupted = True
+                        break
+                    
+                    x = batch[0]
+                    y = batch[1]
+                    
+                    if self.max_train_length is not None and x.size(1) > self.max_train_length:
+                        window_offset = np.random.randint(x.size(1) - self.max_train_length + 1)
+                        x = x[:, window_offset : window_offset + self.max_train_length]
+                    x = x.to(self.device)
+                    
+                    ts_l = x.size(1)
+                    crop_l = np.random.randint(low=2 ** (self.temporal_unit + 1), high=ts_l+1)
+                    if crop_l > 400:
+                        crop_l = 400
+                    crop_left = np.random.randint(ts_l - crop_l + 1)
+                    crop_right = crop_left + crop_l
+                    crop_eleft = np.random.randint(crop_left + 1)
+                    crop_eright = np.random.randint(low=crop_right, high=ts_l + 1)
+                    crop_offset = np.random.randint(low=-crop_eleft, high=ts_l - crop_eright + 1, size=x.size(0))
+                    
+                    optimizer.zero_grad()
+                    
+                    out1 = self._net(take_per_row(x, crop_offset + crop_eleft, crop_right - crop_eleft))
+                    out1 = out1[:, -crop_l:]
+                    
+                    out2 = self._net(take_per_row(x, crop_offset + crop_left, crop_eright - crop_left))
+                    out2 = out2[:, :crop_l]
+                    
+                    loss = hierarchical_contrastive_loss(
+                        out1,
+                        out2,
+                        temporal_unit=self.temporal_unit
+                    )
+                    
+                    out1 = F.max_pool1d(
+                        out1.transpose(1, 2),
+                        kernel_size = out1.size(1),
+                    ).transpose(1, 2)
+                    out2 = F.max_pool1d(
+                        out2.transpose(1, 2),
+                        kernel_size = out2.size(1),
+                    ).transpose(1, 2)
+                    out = torch.cat((out1, out2), dim=1)
+                    lossS = contLoss(out, labels=y) * 0.5
+                    loss = loss + lossS
+                    # loss = lossS
+                    
+                        
+                    cum_loss += loss.item()
+                    n_epoch_iters += 1
+                    
+                    self.n_iters += 1
+                    
+                    if self.after_iter_callback is not None:
+                        self.after_iter_callback(self, loss.item())
+            if interrupted:
+                break
+            
+            
+            cum_loss /= n_epoch_iters
+            loss_val_log.append(cum_loss)
+            
+            if verbose:
+                print(f"Epoch #{self.n_epochs}: train_loss={train_loss} - val_loss={cum_loss}")
+            
+            
+            
+            # if early_stopper.early_stop(cum_loss):             
+            #     print('Early Stop')
+            #     break
+            
+        return loss_log, loss_val_log
     
     def _eval_with_pooling(self, x, mask=None, slicing=None, encoding_window=None):
         out = self.net(x.to(self.device, non_blocking=True), mask)
